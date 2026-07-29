@@ -656,6 +656,9 @@ class UnitreeSdk2IsaacBridge:
         self.joint_id_by_sdk_index = self._resolve_joint_mapping()
         self.last_effort_target = torch.zeros((1, robot.num_joints), device=self.device, dtype=torch.float32)
         self.startup_hold_target_joint_pos: torch.Tensor | None = None
+        self.hold_default_pose_enabled = bool(args_cli.hold_default_pose)
+        self.hold_override_enabled = False
+        self._position_gains_enabled = (not bool(args_cli.use_lowcmd_kp_kd)) and bool(self.hold_default_pose_enabled)
         self._fd_prev_joint_pos: torch.Tensor | None = None
         self._fd_prev_joint_vel: torch.Tensor | None = None
         self._last_joint_vel_sim: torch.Tensor | None = None
@@ -687,6 +690,33 @@ class UnitreeSdk2IsaacBridge:
         self.low_cmd_suber = ChannelSubscriber(TOPIC_LOWCMD, spec.low_cmd_type)
         self.low_cmd_suber.Init(self.low_cmd_handler, 10)
 
+    def _set_position_gains_enabled(self, enabled: bool):
+        if args_cli.use_lowcmd_kp_kd:
+            return
+        enabled = bool(enabled)
+        if enabled == self._position_gains_enabled:
+            return
+        self._position_gains_enabled = enabled
+        if enabled:
+            self.robot.write_joint_stiffness_to_sim(float(args_cli.startup_hold_kp))
+            self.robot.write_joint_damping_to_sim(float(args_cli.startup_hold_kd))
+        else:
+            self.robot.write_joint_stiffness_to_sim(0.0)
+            self.robot.write_joint_damping_to_sim(0.0)
+
+    def _hold_active(self) -> bool:
+        return bool(self.hold_override_enabled) or (not bool(self.command_received) and bool(self.hold_default_pose_enabled))
+
+    def toggle_hold_override(self):
+        self.hold_override_enabled = not bool(self.hold_override_enabled)
+        if self.hold_override_enabled:
+            self.startup_hold_target_joint_pos = self.robot.data.joint_pos.clone()
+        if not self.command_received:
+            self._set_position_gains_enabled(self._hold_active())
+        state = "enabled" if self.hold_override_enabled else "disabled"
+        note = " (overrides lowcmd)" if self.command_received else ""
+        print(f"[INFO] Startup hold override {state}{note}.")
+
     def _resolve_joint_mapping(self) -> list[int | None]:
         joint_name_to_id = {name: index for index, name in enumerate(self.robot.joint_names)}
         mapping: list[int | None] = []
@@ -713,6 +743,7 @@ class UnitreeSdk2IsaacBridge:
             self.low_cmd_count += 1
             self.last_low_cmd_wall_time = time.time()
             if self.low_cmd_count == 1:
+                self._set_position_gains_enabled(True)
                 print("[INFO] Received first rt/lowcmd message.")
 
     def reset_robot(self):
@@ -726,8 +757,7 @@ class UnitreeSdk2IsaacBridge:
             self.robot.write_joint_stiffness_to_sim(0.0)
             self.robot.write_joint_damping_to_sim(0.0)
         else:
-            self.robot.write_joint_stiffness_to_sim(float(args_cli.startup_hold_kp))
-            self.robot.write_joint_damping_to_sim(float(args_cli.startup_hold_kd))
+            self._set_position_gains_enabled(self.command_received or self._hold_active())
         self.robot.reset()
         self.last_effort_target.zero_()
         self.startup_hold_target_joint_pos = None
@@ -772,7 +802,8 @@ class UnitreeSdk2IsaacBridge:
         self._last_joint_vel_sim = joint_vel_sim.clone()
         self._last_joint_vel_used = joint_vel_used.clone()
         max_tau = float(args_cli.startup_hold_max_tau)
-        if args_cli.startup_hold_mode == "asset":
+        mode = "lock_current" if self.hold_override_enabled else str(args_cli.startup_hold_mode)
+        if mode == "asset":
             default_joint_pos = self.robot.data.default_joint_pos
             default_kp = self.robot.data.default_joint_stiffness
             default_kd = self.robot.data.default_joint_damping
@@ -788,7 +819,9 @@ class UnitreeSdk2IsaacBridge:
 
     def apply_low_cmd(self, sim_dt: float):
         if not self.command_received:
-            if args_cli.hold_default_pose:
+            hold_active = self._hold_active()
+            self._set_position_gains_enabled(hold_active)
+            if hold_active:
                 if args_cli.use_lowcmd_kp_kd:
                     self.last_effort_target = self._startup_hold_command(sim_dt)
                     self.robot.set_joint_effort_target(self.last_effort_target)
@@ -809,6 +842,22 @@ class UnitreeSdk2IsaacBridge:
 
         with self.lock:
             cmd = self.latest_low_cmd
+
+        if self.hold_override_enabled:
+            if args_cli.use_lowcmd_kp_kd:
+                self.last_effort_target = self._startup_hold_command(sim_dt)
+                self.robot.set_joint_effort_target(self.last_effort_target)
+            else:
+                if self.startup_hold_target_joint_pos is None:
+                    self.startup_hold_target_joint_pos = self.robot.data.joint_pos.clone()
+                pos_target = self.startup_hold_target_joint_pos.to(torch.float32)
+                vel_target = torch.zeros((1, self.robot.num_joints), device=self.device, dtype=torch.float32)
+                effort_target = torch.zeros((1, self.robot.num_joints), device=self.device, dtype=torch.float32)
+                self.robot.set_joint_position_target(pos_target)
+                self.robot.set_joint_velocity_target(vel_target)
+                self.last_effort_target = effort_target
+                self.robot.set_joint_effort_target(effort_target)
+            return
 
         joint_pos = self.robot.data.joint_pos[0]
         joint_vel_used, joint_vel_sim = self._estimate_joint_vel(sim_dt)
@@ -2498,6 +2547,95 @@ class VirtualHand:
         self._refresh_ui_labels()
 
 
+class StartupHoldToggle:
+    def __init__(self, bridge: UnitreeSdk2IsaacBridge):
+        self.bridge = bridge
+        self._input = None
+        self._keyboard = None
+        self._sub_keyboard = None
+        self._window = None
+        self._ui_models: dict[str, object] = {}
+        self._ui_labels: dict[str, object] = {}
+        self._setup_keyboard()
+        self._setup_ui_window()
+        self.print_help()
+
+    def _setup_keyboard(self):
+        if carb is None or omni is None or args_cli.headless:
+            return
+        try:
+            self._input = carb.input.acquire_input_interface()
+            self._keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+            self._sub_keyboard = self._input.subscribe_to_keyboard_events(self._keyboard, self._on_keyboard_event)
+        except Exception as exc:
+            print(f"[WARN] Startup hold keyboard control unavailable: {exc}")
+            self._input = None
+            self._keyboard = None
+            self._sub_keyboard = None
+
+    def _setup_ui_window(self):
+        if ui is None or args_cli.headless:
+            return
+        self._window = ui.Window(
+            "Startup Hold",
+            width=320,
+            height=150,
+            visible=True,
+            dock_preference=ui.DockPreference.RIGHT_TOP,
+        )
+        with self._window.frame:
+            with ui.VStack(spacing=6, height=0):
+                with ui.HStack(height=24):
+                    ui.Label("Force hold", width=130)
+                    enabled_model = ui.SimpleBoolModel()
+                    enabled_model.set_value(bool(self.bridge.hold_override_enabled))
+                    enabled_model.add_value_changed_fn(lambda model: self._set_enabled(bool(model.as_bool)))
+                    ui.CheckBox(model=enabled_model, width=24)
+                    self._ui_models["enabled"] = enabled_model
+                self._ui_labels["state"] = ui.Label("")
+                self._ui_labels["hint"] = ui.Label("Hotkey: H toggle startup hold")
+
+    def _set_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == bool(self.bridge.hold_override_enabled):
+            return
+        self.bridge.toggle_hold_override()
+        self._sync_ui_models()
+
+    def _sync_ui_models(self):
+        if "enabled" in self._ui_models:
+            self._ui_models["enabled"].set_value(bool(self.bridge.hold_override_enabled))
+
+    def _refresh_ui_labels(self):
+        if not self._ui_labels:
+            return
+        override = bool(self.bridge.hold_override_enabled)
+        received = bool(self.bridge.command_received)
+        if override:
+            self._ui_labels["state"].text = "State: HOLD (override)" if received else "State: HOLD (pre-cmd)"
+        else:
+            default_hold = bool(self.bridge.hold_default_pose_enabled)
+            if received:
+                self._ui_labels["state"].text = "State: LOWCMD"
+            else:
+                self._ui_labels["state"].text = "State: HOLD (default)" if default_hold else "State: PASSIVE"
+
+    def _on_keyboard_event(self, event):
+        if event.type != carb.input.KeyboardEventType.KEY_PRESS:
+            return True
+        if event.input.name == "H":
+            self.bridge.toggle_hold_override()
+            self._sync_ui_models()
+        return True
+
+    def print_help(self):
+        print("[INFO] Startup hold controls:")
+        print("  press H     : toggle startup hold override on/off")
+
+    def step(self, _sim_dt: float):
+        self._refresh_ui_labels()
+
+
 def design_scene(robot_spec: RobotSpec) -> Articulation:
     ground_cfg = sim_utils.GroundPlaneCfg()
     ground_cfg.func("/World/defaultGroundPlane", ground_cfg)
@@ -2535,8 +2673,12 @@ def design_scene(robot_spec: RobotSpec) -> Articulation:
                 joint_names_expr=[".*"],
                 effort_limit_sim=500.0,
                 velocity_limit_sim=100.0,
-                stiffness=0.0 if args_cli.use_lowcmd_kp_kd else float(args_cli.startup_hold_kp),
-                damping=0.0 if args_cli.use_lowcmd_kp_kd else float(args_cli.startup_hold_kd),
+                stiffness=0.0
+                if args_cli.use_lowcmd_kp_kd or (not bool(args_cli.hold_default_pose))
+                else float(args_cli.startup_hold_kp),
+                damping=0.0
+                if args_cli.use_lowcmd_kp_kd or (not bool(args_cli.hold_default_pose))
+                else float(args_cli.startup_hold_kd),
             )
         },
         articulation_root_prim_path=articulation_root_prim_path,
@@ -2580,6 +2722,7 @@ def main():
     else:
         hoist = NullTool()
     virtual_hand = VirtualHand(robot) if args_cli.enable_virtual_hand else NullTool()
+    startup_hold = StartupHoldToggle(bridge) if (not args_cli.headless) else NullTool()
     print("[INFO] Unitree SDK2 Isaac bridge is running.")
     print(
         f"[INFO] Robot: {robot_spec.name}, dt: {args_cli.physics_dt}, "
@@ -2597,6 +2740,7 @@ def main():
         robot.permanent_wrench_composer.reset()
         hoist.step(sim_dt)
         virtual_hand.step(sim_dt)
+        startup_hold.step(sim_dt)
         robot.write_data_to_sim()
         sim.step()
         robot.update(sim_dt)

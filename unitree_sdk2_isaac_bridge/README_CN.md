@@ -1,9 +1,16 @@
 # Unitree SDK2 Bridge (Isaac Lab / Isaac Sim)
 
-本脚本用于把 Unitree SDK2 (DDS) 的低层话题桥接到 Isaac Lab 的机器人仿真中，实现“用真机同款 `rt/lowcmd` 控制仿真机器人，并发布 `rt/lowstate` 等状态话题”。
+![alt text](doc/image1.png)
 
-- 脚本路径：[unitree_sdk2_bridge.py](file:///media/unitree/HDDStorage/brigham/IsaacLab/scripts/demos/unitree_sdk2_bridge.py)
-- 参考实现（MuJoCo 版本）：[unitree_sdk2py_bridge.py](file:///media/unitree/HDDStorage/brigham/unitree_mujoco/simulate_python/unitree_sdk2py_bridge.py)
+把 Unitree SDK2 (DDS) 的低层话题桥接到 Isaac Lab 的机器人仿真中，实现用 `rt/lowcmd` 控制仿真机器人，并发布 `rt/lowstate` 等状态话题。
+
+- 参考实现[unitree_sdk2py_bridge.py](https://github.com/unitreerobotics/unitree_mujoco/blob/main/simulate_python/unitree_sdk2py_bridge.py)
+
+# 依赖
+
+- [Isaac Lab](https://github.com/isaac-sim/IsaacLab)
+- [Unitree SDK2 Python](https://github.com/unitreerobotics/unitree_sdk2_python)
+- [Unitree RL Lab](https://github.com/unitreerobotics/unitree_rl_lab)
 
 ## 话题与数据流
 
@@ -15,17 +22,14 @@
 - `rt/sportmodestate`
 - `rt/wirelesscontroller`
 
-**控制侧核心思想**
+**控制说明**
 - Unitree `LowCmd` 本身包含 `q/dq/kp/kd/tau` 五元组。
-- 本 bridge 支持两种模式：
-  - 默认：忽略 `kp/kd`（推荐用于提高仿真稳定性，避免 D 项对速度噪声/异常过度放大）。
-  - 显式开启：使用 `kp/kd`（Unitree 风格，bridge 内做显式 PD，输出力矩）。
 
 ## 快速启动
 
 ### 1) Isaac Sim / Isaac Lab 启动桥接
 
-以 H2 为例（loopback，便于避免串台）：
+以 H2 为例：
 
 ```bash
 python /media/unitree/HDDStorage/brigham/IsaacLab/scripts/demos/unitree_sdk2_bridge.py \
@@ -40,24 +44,21 @@ python /media/unitree/HDDStorage/brigham/IsaacLab/scripts/demos/unitree_sdk2_bri
 - 若不传 `--support-preset` / `--support-constraint` / `--enable-hoist` / `--enable-virtual-hand`，默认不启用任何“吊架/支撑/虚拟手”功能，只做 DDS ↔ 仿真关节桥接。
 - `--support-preset full_hoist` 当前等价于“给 pelvis 加一个 `prismatic_z` 世界约束”，用于防摔与抬高高度；对应窗口为 `Support Prismatic Z`。
 
-### 2) 外部控制脚本（示例）
+### 2) 外部控制脚本
 
-以 `test_HW_AC_03.py` 为例，务必与 bridge 使用同一网卡（推荐 `lo`）：
-
-```bash
-python /media/unitree/HDDStorage/brigham/Gr00T_Test/test_HW_AC_03.py --sim --iface lo
-```
+- domain_id=0（默认）
+- 直接发出DDS `LowCmd` 话题到 `rt/lowcmd`，即可控制仿真机器人。
 
 ## 支撑/吊架/虚拟手（推荐用法）
 
 这三者目标不同：
-- **Support Constraint（推荐）**：用 Physics Joint 把机器人某个刚体 link 约束到世界坐标系（最稳、最符合“防摔吊架”的常见做法）。
-- **Hoist（实验）**：外力/硬约束模拟“绳子”，更容易出现数值不稳定或不符合力学预期。
+- **Support Constraint（推荐）**：用 Physics Joint 把机器人某个刚体 link 约束到世界坐标系。类似于真机的吊架。
+- **Hoist（实验）**：外力/硬约束模拟“绳子”。
 - **Virtual Hand（实验）**：对某个 body 施加外力，用于抬起/扶住某个部位做交互测试。
 
-### Support Constraint（推荐：prismatic_z）
+### Support Constraint
 
-最常用：只允许沿 Z 轴上下滑动，禁止翻滚摔倒。
+![alt text](doc/image2.png)
 
 ```bash
 python /media/unitree/HDDStorage/brigham/IsaacLab/scripts/demos/unitree_sdk2_bridge.py \
@@ -75,6 +76,8 @@ GUI/热键（窗口：`Support Prismatic Z`）：
 - `B/N`：步进升/降 `Target Z`
 
 ### Virtual Hand（实验）
+
+![alt text](doc/image3.png)
 
 启动时打开工具（随后可用热键开关施力）：
 
@@ -131,14 +134,17 @@ python /media/unitree/HDDStorage/brigham/IsaacLab/scripts/demos/unitree_sdk2_bri
 
 该开关用于在“仿真稳定性”和“复现真机 lowcmd 行为”之间切换。
 
-### 启动保持（还没收到 lowcmd 前）
+### 启动保持（站立锁定）
+
+![alt text](doc/image4.png)
+
 - `--hold-default-pose / --no-hold-default-pose`：是否在未收到 lowcmd 前保持姿态。
 - `--startup-hold-mode`
   - `asset`：使用资产自带 `default_joint_stiffness/damping` 做轻量保持
   - `lock_current`：锁定启动瞬间姿态（使用下面的 kp/kd）
 - `--startup-hold-kp / --startup-hold-kd / --startup-hold-max-tau`：启动保持参数。
 
-### 速度来源（用于 D 项或诊断）
+### 速度来源
 - `--velocity-source sim|fd`
   - `sim`：使用 PhysX 提供的关节速度 `joint_vel`
   - `fd`：使用有限差分 `(q[t]-q[t-1])/dt` 估计速度
