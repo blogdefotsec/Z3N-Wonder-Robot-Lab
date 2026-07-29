@@ -148,7 +148,7 @@ parser.add_argument(
 parser.add_argument(
     "--h2-usd",
     type=str,
-    default="/media/unitree/HDDStorage/brigham/h2_with_sharpa/H2_with_sharpa/H2_with_sharpa.usd",
+    default="",
     help="USD used for H2 simulation.",
 )
 parser.add_argument(

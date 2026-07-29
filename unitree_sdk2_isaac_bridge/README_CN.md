@@ -110,7 +110,7 @@ GUI/热键（窗口：`Virtual Hand Control`）：
 仅在你明确想测试“外力吊挂”时使用：
 
 ```bash
-python /media/unitree/HDDStorage/brigham/IsaacLab/scripts/demos/unitree_sdk2_bridge.py \
+python unitree_sdk2_bridge.py \
   --robot h2 \
   --interface lo \
   --enable-hoist \

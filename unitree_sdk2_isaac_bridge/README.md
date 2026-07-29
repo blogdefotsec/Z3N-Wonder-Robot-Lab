@@ -110,7 +110,7 @@ GUI / hotkeys (window: `Virtual Hand Control`):
 Use only when you explicitly want to test “external-force hoisting”:
 
 ```bash
-python /media/unitree/HDDStorage/brigham/IsaacLab/scripts/demos/unitree_sdk2_bridge.py \
+python unitree_sdk2_bridge.py \
   --robot h2 \
   --interface lo \
   --enable-hoist \
